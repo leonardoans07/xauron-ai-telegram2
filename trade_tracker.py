@@ -1,15 +1,18 @@
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from storage import load_state, save_state
-from config import STATE_FILE, MAX_ACTIVE_TRADES
+
+STATE_FILE = "state_trades.json"
+
 
 @dataclass
 class VirtualTrade:
+    chat_id: int
     symbol: str
-    tf: str               # ex: "5m"
-    side: str             # "BUY" ou "SELL"
+    tf: str
+    side: str          # "BUY" ou "SELL"
     score: int
     entry: float
     sl: float
@@ -18,41 +21,22 @@ class VirtualTrade:
     tp3: float
     created_at: float
 
-    # flags
     hit_tp1: bool = False
     hit_tp2: bool = False
     hit_tp3: bool = False
     hit_sl: bool = False
     closed: bool = False
 
-    # último preço visto (evita aviso duplicado)
     last_price: Optional[float] = None
 
-def _is_buy(side: str) -> bool:
-    return side.strip().upper() == "BUY"
 
-def _crossed(level: float, prev: Optional[float], now: float, up: bool) -> bool:
-    """
-    Detecta cruzamento. Se prev for None, usa 'encostou' simples.
-    """
-    if prev is None:
-        return now >= level if up else now <= level
-    return (prev < level <= now) if up else (prev > level >= now)
-
-def add_trade(trade: VirtualTrade) -> None:
+def add_trade(tr: VirtualTrade) -> None:
     state = load_state(STATE_FILE)
     trades: List[Dict[str, Any]] = state.get("trades", [])
-
-    # limita quantidade
-    active = [t for t in trades if not t.get("closed")]
-    if len(active) >= MAX_ACTIVE_TRADES:
-        # fecha o mais antigo automaticamente
-        active_sorted = sorted(active, key=lambda x: x.get("created_at", 0))
-        active_sorted[0]["closed"] = True
-
-    trades.append(asdict(trade))
+    trades.append(asdict(tr))
     state["trades"] = trades
     save_state(STATE_FILE, state)
+
 
 def list_active_trades() -> List[VirtualTrade]:
     state = load_state(STATE_FILE)
@@ -63,38 +47,43 @@ def list_active_trades() -> List[VirtualTrade]:
         out.append(VirtualTrade(**t))
     return out
 
+
 def update_trade(updated: VirtualTrade) -> None:
     state = load_state(STATE_FILE)
     trades = state.get("trades", [])
     for i, t in enumerate(trades):
-        if (t.get("created_at") == updated.created_at and
-            t.get("symbol") == updated.symbol and
-            t.get("side") == updated.side and
-            t.get("entry") == updated.entry):
+        if (
+            t.get("created_at") == updated.created_at
+            and t.get("chat_id") == updated.chat_id
+            and t.get("symbol") == updated.symbol
+            and t.get("side") == updated.side
+            and float(t.get("entry")) == float(updated.entry)
+        ):
             trades[i] = asdict(updated)
             break
     state["trades"] = trades
     save_state(STATE_FILE, state)
 
+
+def _crossed(level: float, prev: Optional[float], now: float, up: bool) -> bool:
+    # Se não tem prev (primeira leitura), considera "tocou"
+    if prev is None:
+        return now >= level if up else now <= level
+    return (prev < level <= now) if up else (prev > level >= now)
+
+
 def check_hits(tr: VirtualTrade, price: float) -> List[str]:
     """
-    Retorna lista de eventos: ["TP1", "TP2", "TP3", "SL"] conforme bater.
+    Retorna eventos em ordem: ["SL"] ou ["TP1","TP2","TP3"] etc.
+    Fecha no SL ou no TP3.
     """
-    events = []
-    buy = _is_buy(tr.side)
+    events: List[str] = []
+    buy = tr.side.strip().upper() == "BUY"
 
     prev = tr.last_price
     tr.last_price = price
 
-    # SL primeiro (se bater SL, encerra)
-    if not tr.hit_sl and not tr.closed:
-        if _crossed(tr.sl, prev, price, up=buy is False):  # BUY: SL abaixo (down); SELL: SL acima (up)
-            # Para BUY, SL é abaixo: cruzar pra baixo => up=False
-            # Para SELL, SL é acima: cruzar pra cima => up=True
-            # A lógica acima não fica bonita, então fazemos explícito:
-            pass
-
-    # explícito (mais seguro)
+    # SL (encerra)
     if not tr.hit_sl and not tr.closed:
         if buy:
             if _crossed(tr.sl, prev, price, up=False):
@@ -109,7 +98,7 @@ def check_hits(tr: VirtualTrade, price: float) -> List[str]:
                 events.append("SL")
                 return events
 
-    # TP1/TP2/TP3
+    # TP1
     if not tr.hit_tp1 and not tr.closed:
         if buy and _crossed(tr.tp1, prev, price, up=True):
             tr.hit_tp1 = True
@@ -118,6 +107,7 @@ def check_hits(tr: VirtualTrade, price: float) -> List[str]:
             tr.hit_tp1 = True
             events.append("TP1")
 
+    # TP2
     if not tr.hit_tp2 and not tr.closed:
         if buy and _crossed(tr.tp2, prev, price, up=True):
             tr.hit_tp2 = True
@@ -126,6 +116,7 @@ def check_hits(tr: VirtualTrade, price: float) -> List[str]:
             tr.hit_tp2 = True
             events.append("TP2")
 
+    # TP3 (encerra)
     if not tr.hit_tp3 and not tr.closed:
         if buy and _crossed(tr.tp3, prev, price, up=True):
             tr.hit_tp3 = True
